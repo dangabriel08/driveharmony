@@ -1,1 +1,0 @@
-<the entire Apps Script code from the assistant’s previous message>
