@@ -39,7 +39,9 @@ const headers = [
   'Description',
   'Member count',
   'Members',
-  'Group ID'
+  'Group ID',
+  'Folder Sync Status',
+  'Last Folder Sync'
 ];
 
 // === Column indices (1-based) ===
@@ -50,6 +52,8 @@ const COL = {
   MEMBER_COUNT: 4,
   MEMBERS: 5,
   GROUP_ID: 6,
+  SYNC_STATUS: 7,
+  SYNC_LAST_RUN: 8,
 };
 
 // === Queueing constants (batched “ALL groups”) ===
@@ -112,6 +116,26 @@ function writeGroupsToSheet_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
 
+  // Capture existing status/last sync so we can preserve it on refresh.
+  const statusCache = new Map();
+  const lastRow = sh.getLastRow();
+  if (lastRow >= 2) {
+    const width = Math.min(sh.getLastColumn(), headers.length);
+    if (width >= COL.EMAIL) {
+      const existing = sh.getRange(2, 1, lastRow - 1, width).getValues();
+      existing.forEach(row => {
+        const email = row[COL.EMAIL - 1] || '';
+        const id = row[COL.GROUP_ID - 1] || '';
+        const name = row[COL.NAME - 1] || '';
+        const key = buildGroupKey_(email, id, name);
+        if (!key) return;
+        const status = row[COL.SYNC_STATUS - 1] || '';
+        const lastSync = row[COL.SYNC_LAST_RUN - 1] || '';
+        statusCache.set(key, { status, lastSync });
+      });
+    }
+  }
+
   // CLEAR then headers
   sh.clear();
   sh.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -134,13 +158,17 @@ function writeGroupsToSheet_() {
       const desc = g.description || '';
       const { directCount, memberList } = getGroupMembers_(email);
 
+      const key = buildGroupKey_(email, g.id, name);
+      const cached = statusCache.get(key) || {};
       rows.push([
         name,              // Group Name
         email,             // Email
         desc,              // Description
         directCount,       // Member count
         memberList,        // Members (newline-separated)
-        g.id || ''         // Group ID
+        g.id || '',        // Group ID
+        cached.status || 'Not started',
+        cached.lastSync || ''
       ]);
     }
     pageToken = resp.nextPageToken || null;
@@ -153,7 +181,7 @@ function writeGroupsToSheet_() {
     sh.autoResizeColumns(1, headers.length);
   }
 
-  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
   const stamp = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
   sh.getRange(1, 1).setNote(`Last sync: ${stamp} (${tz})`);
 }
@@ -191,7 +219,7 @@ function capitalize_(s) {
    PER-GROUP TABS
    ========================= */
 function buildFolderTabForSelectedRow() {
-  const ss = SpreadsheetApp.getActive();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const main = ss.getSheetByName(SHEET_NAME);
   const r = main.getActiveCell().getRow();
   if (r < 2) {
@@ -210,8 +238,16 @@ function buildFolderTabForSelectedRow() {
   const groupDisplayName = name || email || key;
   const groupEmail = email || resolveGroupIdentity_(key).email;
 
-  buildOneGroupFolderTab_(groupDisplayName, groupEmail);
-  SpreadsheetApp.getUi().alert(`Built tab for: ${groupDisplayName}`);
+  try {
+    updateGroupSyncStatus_(r, 'Running...', null);
+    buildOneGroupFolderTab_(groupDisplayName, groupEmail);
+    updateGroupSyncStatus_(r, 'Done', new Date());
+    SpreadsheetApp.getUi().alert(`Built tab for: ${groupDisplayName}`);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    updateGroupSyncStatus_(r, `Error: ${message}`, new Date());
+    SpreadsheetApp.getUi().alert(`Failed to build tab for ${groupDisplayName}: ${message}`);
+  }
 }
 
 /**
@@ -219,7 +255,7 @@ function buildFolderTabForSelectedRow() {
  * Creates a queue in Script Properties and schedules the worker.
  */
 function startBuildFolderTabsForAllGroups() {
-  const ss = SpreadsheetApp.getActive();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const main = ss.getSheetByName(SHEET_NAME);
   const last = main.getLastRow();
   if (last < 2) {
@@ -229,14 +265,40 @@ function startBuildFolderTabsForAllGroups() {
 
   // Build a queue from the main list (prefer email if present)
   const values = main.getRange(2, 1, last - 1, headers.length).getValues();
-  const items = values.map(row => ({
-    name: String(row[COL.NAME - 1] || ''),
-    email: String(row[COL.EMAIL - 1] || ''),
-    id: String(row[COL.GROUP_ID - 1] || '')
-  }));
+  const queuedItems = [];
+  const statusCol = [];
+  const lastSyncCol = [];
+
+  values.forEach((row, idx) => {
+    const rowNumber = idx + 2;
+    const name = String(row[COL.NAME - 1] || '');
+    const email = String(row[COL.EMAIL - 1] || '');
+    const id = String(row[COL.GROUP_ID - 1] || '');
+    const hasIdentifier = Boolean(email || id);
+
+    if (!hasIdentifier) {
+      statusCol.push(['Skipped (missing email/id)']);
+      lastSyncCol.push([row[COL.SYNC_LAST_RUN - 1] || '']);
+      return;
+    }
+
+    queuedItems.push({ name, email, id, rowNumber });
+    statusCol.push(['Queued']);
+    lastSyncCol.push(['']);
+  });
+
+  if (statusCol.length) {
+    main.getRange(2, COL.SYNC_STATUS, statusCol.length, 1).setValues(statusCol);
+    main.getRange(2, COL.SYNC_LAST_RUN, lastSyncCol.length, 1).setValues(lastSyncCol);
+  }
+
+  if (!queuedItems.length) {
+    SpreadsheetApp.getUi().alert('No groups were queued. Ensure each row has an Email or Group ID.');
+    return;
+  }
 
   const props = PropertiesService.getScriptProperties();
-  props.setProperty(BUILD_QUEUE_KEY, JSON.stringify(items));
+  props.setProperty(BUILD_QUEUE_KEY, JSON.stringify(queuedItems));
   props.setProperty(BUILD_INDEX_KEY, '0');
   props.setProperty(BUILD_STATE_KEY, 'RUNNING');
 
@@ -244,7 +306,7 @@ function startBuildFolderTabsForAllGroups() {
   deleteTriggersFor_(BUILD_TRIG_TAG);
   ScriptApp.newTrigger(BUILD_TRIG_TAG).timeBased().after(1000).create(); // kick off in ~1s
 
-  SpreadsheetApp.getUi().alert(`Queued ${items.length} group(s). Building in batches of ${BUILD_BATCH_SIZE}…`);
+  SpreadsheetApp.getUi().alert(`Queued ${queuedItems.length} group(s). Building in batches of ${BUILD_BATCH_SIZE}...`);
 }
 
 /** Worker: process next batch and reschedule if more remain */
@@ -274,12 +336,21 @@ function continueBuildAllGroupTabs_() {
     const item = queue[i];
     try {
       const display = item.name || item.email || item.id;
+      const rowNumber = item.rowNumber;
+      updateGroupSyncStatus_(rowNumber, 'Running...', null);
+
       const email = item.email || resolveGroupIdentity_(item.id || item.name).email;
       buildOneGroupFolderTab_(display, email);
+      updateGroupSyncStatus_(rowNumber, 'Done', new Date());
       // yield a tiny bit (helps UI/quotas)
       Utilities.sleep(200);
     } catch (e) {
-      Logger.log(`Error on ${item && (item.email || item.name || item.id)}: ${e && e.message ? e.message : e}`);
+      const rowNumber = item && item.rowNumber;
+      const errorText = e && e.message ? e.message : String(e);
+      if (rowNumber) {
+        updateGroupSyncStatus_(rowNumber, `Error: ${errorText}`, new Date());
+      }
+      Logger.log(`Error on ${item && (item.email || item.name || item.id)}: ${errorText}`);
     }
   }
 
@@ -301,7 +372,23 @@ function continueBuildAllGroupTabs_() {
 /** Cancel current queued build */
 function cancelBuildAllGroupTabs() {
   const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(BUILD_QUEUE_KEY);
+  const idxStr = props.getProperty(BUILD_INDEX_KEY);
+  if (raw && idxStr !== null) {
+    try {
+      const queue = JSON.parse(raw);
+      const processed = Number(idxStr) || 0;
+      for (let i = processed; i < queue.length; i++) {
+        const rowNumber = queue[i] && queue[i].rowNumber;
+        if (rowNumber) updateGroupSyncStatus_(rowNumber, 'Canceled', null);
+      }
+    } catch (err) {
+      Logger.log(`Failed to update status during cancel: ${err && err.message ? err.message : err}`);
+    }
+  }
   props.setProperty(BUILD_STATE_KEY, 'IDLE');
+  props.deleteProperty(BUILD_QUEUE_KEY);
+  props.deleteProperty(BUILD_INDEX_KEY);
   deleteTriggersFor_(BUILD_TRIG_TAG);
   SpreadsheetApp.getUi().alert('Canceled the running build.');
 }
@@ -319,7 +406,7 @@ function deleteTriggersFor_(handlerName) {
  * Columns: Path, Folder name, Link, Folder ID, Drive
  */
 function buildOneGroupFolderTab_(groupName, groupEmail) {
-  const ss = SpreadsheetApp.getActive();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const tabName = sanitizeSheetName_(groupName).slice(0, 80); // safe length
 
   // Reuse existing tab if present; otherwise create it.
@@ -359,7 +446,7 @@ function buildOneGroupFolderTab_(groupName, groupEmail) {
     sh.autoResizeColumns(1, HEAD.length);
   }
 
-  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
   const stamp = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
   sh.getRange(1, 1).setNote(`Group: ${groupName} <${groupEmail}> — generated ${stamp}`);
 }
@@ -401,6 +488,49 @@ function computeFullPath_(file, cache) {
   }
 
   return { pathParts: parts, depth, driveName };
+}
+
+/* ===== Utility helpers ===== */
+function updateGroupSyncStatus_(rowNumber, status, timestamp) {
+  if (!rowNumber) return;
+  const main = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!main) return;
+
+  if (status !== undefined) {
+    main.getRange(rowNumber, COL.SYNC_STATUS).setValue(status);
+  }
+
+  if (timestamp !== undefined) {
+    const range = main.getRange(rowNumber, COL.SYNC_LAST_RUN);
+    if (timestamp === null || timestamp === '') {
+      range.setValue('');
+    } else if (timestamp instanceof Date) {
+      range.setValue(formatTimestamp_(timestamp));
+    } else {
+      range.setValue(String(timestamp));
+    }
+  }
+}
+
+function formatTimestamp_(date) {
+  if (!(date instanceof Date)) return '';
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  return Utilities.formatDate(date, tz, 'yyyy-MM-dd HH:mm:ss');
+}
+
+function buildGroupKey_(email, id, name) {
+  const key = (email || id || name || '').toString().trim().toLowerCase();
+  return key;
+}
+
+function sanitizeSheetName_(name) {
+  const fallback = 'Group';
+  const raw = (name || '').toString().trim();
+  const sanitized = raw
+    .replace(/[:\/\\\?\*\[\]]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return sanitized || fallback;
 }
 
 /* ===== Group/Drive helpers ===== */
