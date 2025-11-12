@@ -31,6 +31,23 @@
 
 const SHEET_NAME = 'Group List ( Automated )';
 const DAILY_TRIGGER_HOUR = 3; // 3 AM
+const LOG_SHEET_NAME = 'Logs';
+const LOG_HEADERS = [
+  'Timestamp',
+  'Event',
+  'Group Name',
+  'Email',
+  'Group ID',
+  'Details',
+  'Members Added',
+  'Members Removed'
+];
+const LOG_EVENTS = {
+  ADDED: 'Added',
+  UPDATED: 'Updated'
+};
+const MEMBER_DIFF_SAMPLE_LIMIT = 10;
+const GROUP_SNAPSHOT_PROP_KEY = 'GROUP_SNAPSHOT_JSON';
 
 // === HEADERS ===
 const headers = [
@@ -71,6 +88,8 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Group Tools')
     .addItem('Refresh Group List', 'refreshGroups')
+    .addItem('Refresh Group Logs only', 'refreshGroupLogsOnly')
+    .addItem('Reset from start', 'resetGroupAuditState')
     .addSeparator()
     .addItem('Build folder tab for selected row', 'buildFolderTabForSelectedRow')
     .addItem('Build folder tabs for ALL groups (queued)', 'startBuildFolderTabsForAllGroups')
@@ -87,6 +106,10 @@ function refreshGroups() {
   writeGroupsToSheet_();
 }
 
+function refreshGroupLogsOnly() {
+  writeGroupsToSheet_({ logsOnly: true });
+}
+
 function createDailyTrigger_() {
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'refreshGroups')
@@ -95,53 +118,79 @@ function createDailyTrigger_() {
     .timeBased().everyDays(1).atHour(DAILY_TRIGGER_HOUR).create();
 }
 
+function resetGroupAuditState() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    'Reset Group Audit',
+    'This will clear the main sheet, Logs tab, and stored snapshot so the next refresh starts from scratch. Continue?',
+    ui.ButtonSet.YES_NO
+  );
+  if (response !== ui.Button.YES) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let main = ss.getSheetByName(SHEET_NAME);
+  if (!main) {
+    main = ss.insertSheet(SHEET_NAME);
+  }
+  main.clear();
+  main.getRange(1, 1, 1, headers.length).setValues([headers]);
+  main.setFrozenRows(1);
+
+  const logSheet = ensureLogSheet_(ss);
+  logSheet.clear();
+  logSheet.getRange(1, 1, 1, LOG_HEADERS.length).setValues([LOG_HEADERS]);
+  logSheet.setFrozenRows(1);
+
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(GROUP_SNAPSHOT_PROP_KEY);
+  props.deleteProperty(BUILD_QUEUE_KEY);
+  props.deleteProperty(BUILD_INDEX_KEY);
+  props.deleteProperty(BUILD_STATE_KEY);
+
+  deleteTriggersFor_(BUILD_TRIG_TAG);
+  ui.alert('Reset complete. Run "Refresh Group List" to seed fresh data.');
+}
+
 function ensureSheetStructure_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh = ss.getSheetByName(SHEET_NAME);
   if (!sh) {
     sh = ss.insertSheet(SHEET_NAME);
-    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sh.setFrozenRows(1);
-    return;
   }
   const existing = sh.getRange(1, 1, 1, headers.length).getValues()[0];
   const mismatch = headers.some((h, i) => existing[i] !== h);
   if (mismatch) {
     sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sh.setFrozenRows(1);
   }
+  sh.setFrozenRows(1);
+  ensureLogSheet_(ss);
 }
 
-function writeGroupsToSheet_() {
+function writeGroupsToSheet_(options) {
+  const opts = options || {};
+  const logsOnly = Boolean(opts.logsOnly);
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+  ensureLogSheet_(ss);
 
-  // Capture existing status/last sync so we can preserve it on refresh.
-  const statusCache = new Map();
-  const lastRow = sh.getLastRow();
-  if (lastRow >= 2) {
-    const width = Math.min(sh.getLastColumn(), headers.length);
-    if (width >= COL.EMAIL) {
-      const existing = sh.getRange(2, 1, lastRow - 1, width).getValues();
-      existing.forEach(row => {
-        const email = row[COL.EMAIL - 1] || '';
-        const id = row[COL.GROUP_ID - 1] || '';
-        const name = row[COL.NAME - 1] || '';
-        const key = buildGroupKey_(email, id, name);
-        if (!key) return;
-        const status = row[COL.SYNC_STATUS - 1] || '';
-        const lastSync = row[COL.SYNC_LAST_RUN - 1] || '';
-        statusCache.set(key, { status, lastSync });
-      });
-    }
+  const { statusCache, snapshotMap } = readSheetState_(sh);
+  const previousGroups = loadGroupSnapshot_();
+  if (!previousGroups.size && snapshotMap.size) {
+    snapshotMap.forEach((snapshot, key) => previousGroups.set(key, snapshot));
   }
 
-  // CLEAR then headers
-  sh.clear();
-  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-  sh.setFrozenRows(1);
+  if (!logsOnly) {
+    sh.clear();
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+  } else if (sh.getLastRow() === 0) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+  }
 
   const rows = [];
+  const logEntries = [];
+  const currentSnapshots = new Map();
   let pageToken = null;
 
   do {
@@ -157,33 +206,55 @@ function writeGroupsToSheet_() {
       const name = g.name || '';
       const desc = g.description || '';
       const { directCount, memberList } = getGroupMembers_(email);
+      const currentSnapshot = {
+        name,
+        email,
+        description: desc,
+        memberCount: normalizeMemberCount_(directCount),
+        members: memberList,
+        id: g.id || ''
+      };
 
       const key = buildGroupKey_(email, g.id, name);
-      const cached = statusCache.get(key) || {};
-      rows.push([
-        name,              // Group Name
-        email,             // Email
-        desc,              // Description
-        directCount,       // Member count
-        memberList,        // Members (newline-separated)
-        g.id || '',        // Group ID
-        cached.status || 'Not started',
-        cached.lastSync || ''
-      ]);
+      currentSnapshots.set(key, currentSnapshot);
+
+      if (!logsOnly) {
+        const cached = statusCache.get(key) || {};
+        rows.push([
+          name,              // Group Name
+          email,             // Email
+          desc,              // Description
+          directCount,       // Member count
+          memberList,        // Members (newline-separated)
+          g.id || '',        // Group ID
+          cached.status || 'Not started',
+          cached.lastSync || ''
+        ]);
+      }
+
+      trackGroupChange_(previousGroups, currentSnapshot, logEntries, key);
     }
     pageToken = resp.nextPageToken || null;
   } while (pageToken);
 
-  if (rows.length) {
+  saveGroupSnapshot_(currentSnapshots);
+
+  if (!logsOnly && rows.length) {
     sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
     sh.getRange(2, COL.DESCRIPTION, rows.length, 1).setWrap(true);
     sh.getRange(2, COL.MEMBERS, rows.length, 1).setWrap(true);
     sh.autoResizeColumns(1, headers.length);
   }
 
-  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
-  const stamp = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
-  sh.getRange(1, 1).setNote(`Last sync: ${stamp} (${tz})`);
+  if (logEntries.length) {
+    appendLogEntries_(logEntries);
+  }
+
+  if (!logsOnly) {
+    const tz = ss.getSpreadsheetTimeZone();
+    const stamp = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
+    sh.getRange(1, 1).setNote(`Last sync: ${stamp} (${tz})`);
+  }
 }
 
 /* Members helper */
@@ -577,4 +648,226 @@ function listFoldersDirectlySharedToGroup_(groupEmail) {
   return results;
 }
 
+function ensureLogSheet_(ss) {
+  const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
+  let logSheet = spreadsheet.getSheetByName(LOG_SHEET_NAME);
+  if (!logSheet) {
+    logSheet = spreadsheet.insertSheet(LOG_SHEET_NAME);
+    logSheet.getRange(1, 1, 1, LOG_HEADERS.length).setValues([LOG_HEADERS]);
+    logSheet.setFrozenRows(1);
+    return logSheet;
+  }
+  const existing = logSheet.getRange(1, 1, 1, LOG_HEADERS.length).getValues()[0];
+  const mismatch = LOG_HEADERS.some((h, i) => existing[i] !== h);
+  if (mismatch) {
+    logSheet.getRange(1, 1, 1, LOG_HEADERS.length).setValues([LOG_HEADERS]);
+  }
+  logSheet.setFrozenRows(1);
+  return logSheet;
+}
+
+function appendLogEntries_(entries) {
+  if (!entries || !entries.length) return;
+  const logSheet = ensureLogSheet_(SpreadsheetApp.getActiveSpreadsheet());
+  const deduped = filterNewLogEntries_(logSheet, entries);
+  if (!deduped.length) return;
+  const startRow = logSheet.getLastRow() + 1;
+  logSheet.getRange(startRow, 1, deduped.length, LOG_HEADERS.length).setValues(deduped);
+}
+
+function readSheetState_(sheet) {
+  const statusCache = new Map();
+  const snapshotMap = new Map();
+  if (!sheet) return { statusCache, snapshotMap };
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { statusCache, snapshotMap };
+  const width = Math.min(sheet.getLastColumn(), headers.length);
+  if (width < COL.EMAIL) return { statusCache, snapshotMap };
+  const existing = sheet.getRange(2, 1, lastRow - 1, width).getValues();
+  existing.forEach(row => {
+    const email = row[COL.EMAIL - 1] || '';
+    const id = row[COL.GROUP_ID - 1] || '';
+    const name = row[COL.NAME - 1] || '';
+    const key = buildGroupKey_(email, id, name);
+    if (!key) return;
+    const status = row[COL.SYNC_STATUS - 1] || '';
+    const lastSync = row[COL.SYNC_LAST_RUN - 1] || '';
+    statusCache.set(key, { status, lastSync });
+    snapshotMap.set(key, {
+      name,
+      email,
+      description: row[COL.DESCRIPTION - 1] || '',
+      memberCount: normalizeMemberCount_(row[COL.MEMBER_COUNT - 1]),
+      members: row[COL.MEMBERS - 1] || '',
+      id
+    });
+  });
+  return { statusCache, snapshotMap };
+}
+
+function loadGroupSnapshot_() {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(GROUP_SNAPSHOT_PROP_KEY);
+  if (!raw) return new Map();
+  try {
+    const parsed = JSON.parse(raw) || {};
+    const map = new Map();
+    Object.keys(parsed).forEach(key => {
+      map.set(key, parsed[key]);
+    });
+    return map;
+  } catch (err) {
+    Logger.log(`Failed to parse stored group snapshot: ${err && err.message ? err.message : err}`);
+    return new Map();
+  }
+}
+
+function saveGroupSnapshot_(snapshotMap) {
+  const props = PropertiesService.getScriptProperties();
+  const payload = {};
+  if (snapshotMap && snapshotMap.size) {
+    snapshotMap.forEach((value, key) => {
+      payload[key] = value;
+    });
+  }
+  props.setProperty(GROUP_SNAPSHOT_PROP_KEY, JSON.stringify(payload));
+}
+
+function trackGroupChange_(previousMap, currentSnapshot, logEntries, keyOverride) {
+  const key = keyOverride || buildGroupKey_(currentSnapshot.email, currentSnapshot.id, currentSnapshot.name);
+  if (!key) return;
+  const previous = previousMap.get(key);
+  if (!previous) {
+    logEntries.push(buildLogRow_(LOG_EVENTS.ADDED, currentSnapshot, 'Group added to Admin Directory listing.', [], []));
+    return;
+  }
+  previousMap.delete(key);
+  const diffResult = diffGroupSnapshots_(previous, currentSnapshot);
+  const summaryText = diffResult.summaries.join('; ');
+  if (summaryText || diffResult.addedMembers.length || diffResult.removedMembers.length) {
+    const details = summaryText || 'Members updated';
+    logEntries.push(buildLogRow_(LOG_EVENTS.UPDATED, currentSnapshot, details, diffResult.addedMembers, diffResult.removedMembers));
+  }
+}
+
+function diffGroupSnapshots_(previous, current) {
+  const summaries = [];
+  let addedMembers = [];
+  let removedMembers = [];
+  if ((previous.name || '') !== (current.name || '')) {
+    summaries.push(`Name changed: "${previous.name || ''}" → "${current.name || ''}"`);
+  }
+  if ((previous.email || '') !== (current.email || '')) {
+    summaries.push(`Email changed: "${previous.email || ''}" → "${current.email || ''}"`);
+  }
+  if ((previous.description || '') !== (current.description || '')) {
+    summaries.push('Description updated');
+  }
+  const prevCount = normalizeMemberCount_(previous.memberCount);
+  const currCount = normalizeMemberCount_(current.memberCount);
+  if (prevCount !== currCount) {
+    summaries.push(`Member count ${prevCount} → ${currCount}`);
+  }
+  const memberDiffs = diffMemberLists_(previous.members, current.members);
+  if (memberDiffs) {
+    if (memberDiffs.messages.length) {
+      memberDiffs.messages.forEach(msg => summaries.push(msg));
+    } else if ((previous.members || '') !== (current.members || '')) {
+      summaries.push('Members list changed');
+    }
+    addedMembers = memberDiffs.addedList;
+    removedMembers = memberDiffs.removedList;
+  } else if ((previous.members || '') !== (current.members || '')) {
+    summaries.push('Members list changed');
+  }
+  return { summaries, addedMembers, removedMembers };
+}
+
+function buildLogRow_(eventType, snapshot, details, membersAdded, membersRemoved) {
+  return [
+    formatTimestamp_(new Date()),
+    eventType,
+    snapshot.name || '',
+    snapshot.email || '',
+    snapshot.id || '',
+    details || '',
+    Array.isArray(membersAdded) && membersAdded.length ? membersAdded.join('\n') : '',
+    Array.isArray(membersRemoved) && membersRemoved.length ? membersRemoved.join('\n') : ''
+  ];
+}
+
+function normalizeMemberCount_(value) {
+  if (typeof value === 'number' && isFinite(value)) return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function diffMemberLists_(previousList, currentList) {
+  const prevText = previousList || '';
+  const currText = currentList || '';
+  if (isMembersError_(prevText) || isMembersError_(currText)) return null;
+
+  const prevSet = tokenizeMemberList_(prevText);
+  const currSet = tokenizeMemberList_(currText);
+
+  const added = [];
+  currSet.forEach(member => { if (!prevSet.has(member)) added.push(member); });
+
+  const removed = [];
+  prevSet.forEach(member => { if (!currSet.has(member)) removed.push(member); });
+
+  const messages = [];
+  if (added.length) messages.push(formatMemberChange_('added', added));
+  if (removed.length) messages.push(formatMemberChange_('removed', removed));
+  return { messages, addedList: added, removedList: removed };
+}
+
+function tokenizeMemberList_(text) {
+  const set = new Set();
+  const normalized = (text || '').split('\n').map(s => s.trim()).filter(Boolean);
+  normalized.forEach(entry => set.add(entry));
+  return set;
+}
+
+function formatMemberChange_(type, items) {
+  if (!items.length) return '';
+  const subset = items.slice(0, MEMBER_DIFF_SAMPLE_LIMIT);
+  const suffix = items.length > MEMBER_DIFF_SAMPLE_LIMIT ? ` (+${items.length - MEMBER_DIFF_SAMPLE_LIMIT} more)` : '';
+  return `Members ${type}: ${subset.join(', ')}${suffix}`;
+}
+
+function isMembersError_(text) {
+  return /^\(Unable to list members:/i.test((text || '').trim());
+}
+
 function escapeForQuery_(s) { return String(s).replace(/'/g, "\\'"); }
+
+function filterNewLogEntries_(logSheet, entries) {
+  const existingKeys = new Set();
+  const lastRow = logSheet.getLastRow();
+  if (lastRow >= 2) {
+    const width = LOG_HEADERS.length;
+    const existingRows = logSheet.getRange(2, 1, lastRow - 1, width).getValues();
+    existingRows.forEach(row => {
+      existingKeys.add(buildLogKeyFromRow_(row));
+    });
+  }
+  return entries.filter(entry => {
+    const key = buildLogKeyFromRow_(entry);
+    if (existingKeys.has(key)) return false;
+    existingKeys.add(key);
+    return true;
+  });
+}
+
+function buildLogKeyFromRow_(row) {
+  if (!row) return '';
+  const event = (row[1] || '').toString();
+  const name = (row[2] || '').toString();
+  const email = (row[3] || '').toString();
+  const id = (row[4] || '').toString();
+  const details = (row[5] || '').toString();
+  const membersAdded = (row[6] || '').toString();
+  const membersRemoved = (row[7] || '').toString();
+  return [event, name, email, id, details, membersAdded, membersRemoved].join('||');
+}
